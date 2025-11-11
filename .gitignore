@@ -1,0 +1,26 @@
+# Python build/cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE/editor
+.idea/
+.vscode/
+.DS_Store
+
+# Generated artifacts
+frames/
+*.mp4
+*.csv
+*.log
+results*/
+
+# Large inputs
+annotated_*.mp4
+results_*.csv
+
+# Local datasets / media
+dataset/

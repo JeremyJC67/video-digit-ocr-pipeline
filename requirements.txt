@@ -1,0 +1,8 @@
+opencv-python
+numpy
+pandas
+pytesseract
+Pillow
+streamlit
+# Optional fallback OCR
+# easyocr
