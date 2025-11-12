@@ -1,0 +1,60 @@
+@startuml process_flow
+!theme spacelab
+skinparam shadowing false
+skinparam dpi 150
+
+partition "process_video.py" {
+  start
+  :Parse CLI arguments
+    (--video, --fps, --start_time,
+     --max_duration/percent,
+     --roi, --smooth_window,...);
+  :Open video & read first frame;
+  if (ROI supplied?) then (yes)
+    :Use provided ROI;
+  else
+    :User drags ROI via cv2.selectROI;
+  endif
+  :Derive duration limit & start timestamp;
+  :Create frames directory;
+  if (annotated MP4?) then (yes)
+    :Init VideoWriter at sampled FPS;
+  endif
+}
+
+while (More timestamps within limit?) is (yes)
+  :Seek via CAP_PROP_POS_MSEC;
+  if (Frame read OK?) then (yes)
+    :Crop base ROI from frame;
+    :Focus ROI on blue screen via HSV mask -> tightened ROI + offset;
+    :Extract upper-middle band (25%-65% height) as digits_roi;
+    partition "run_ocr()" {
+      :Try °C anchor strategy;
+      if (Anchor + main line found?) then (yes)
+        :OCR single line (psm7, whitelist 0123456789.,);
+      else (no)
+        :Resize 2x & build dual Otsu variants;
+        :Run Tesseract (psm6 whitelist) and optional EasyOCR;
+        :Score boxes (decimal priority, tall glyphs, near unit, 0-120);
+      endif
+      :Return value + confidence + boxes;
+    }
+    :Median-smooth numeric value (optional 3-frame window);
+    :Save original frame as JPG (HH-MM-SS.jpg);
+    :Append CSV row {time, value, conf, frame_file};
+    if (annotated MP4?) then (yes)
+      :Draw digit ROI + bounding boxes & value label;
+      :Write annotated frame to video;
+    endif
+  else (no)
+    break
+  endif
+  :Advance timestamp by 1000/fps ms;
+endwhile (no)
+
+partition "process_video.py" {
+  :Release VideoCapture & writer;
+  :Write CSV header + rows;
+  stop
+}
+@enduml

@@ -4,11 +4,15 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from statistics import median
+from typing import Deque, List, Optional, Sequence, Tuple
 
 import cv2
+import numpy as np
 
 from ocr_utils import OCRBox, run_ocr
 
@@ -32,11 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_csv", default="results.csv", help="Output CSV path")
     parser.add_argument("--annotated_mp4", help="Optional annotated MP4 output")
     parser.add_argument("--fps", type=float, default=1.0, help="Sampling rate (frames per second)")
-    parser.add_argument(
-        "--max_duration",
-        type=float,
-        help="Only process the first N seconds of the video",
-    )
+    parser.add_argument("--max_duration", type=float, help="Only process the first N seconds of the video")
     parser.add_argument(
         "--max_percent",
         type=float,
@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames_dir", default="frames", help="Directory to store sampled frames for review UI")
     parser.add_argument("--engine_easy_first", action="store_true", help="Try EasyOCR before Tesseract")
     parser.add_argument("--strict_unit", action="store_true", help="Require detected text to include °C/C units")
+    parser.add_argument(
+        "--smooth_window",
+        type=int,
+        default=3,
+        help="Median smoothing window (set <=1 to disable)",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +93,89 @@ def compute_video_duration_ms(cap) -> Optional[float]:
     if frame_count and fps_native and frame_count > 0 and fps_native > 0:
         return float(frame_count / fps_native * 1000.0)
     return None
+
+
+def median_smooth_value(value: Optional[str], history: Optional[Deque[float]], window: int) -> Optional[str]:
+    if history is None or window <= 1:
+        return value
+    if value is None or value == "":
+        return value
+    try:
+        numeric = float(value)
+    except ValueError:
+        return value
+    history.append(numeric)
+    med_val = float(median(history))
+    decimals = len(value.split(".")[1]) if "." in value else 0
+    fmt = "{:." + str(decimals) + "f}" if decimals > 0 else "{:.0f}"
+    return fmt.format(med_val)
+
+
+def parse_float_value(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def temporal_patch_rows(rows: List[dict]) -> None:
+    if len(rows) < 3:
+        return
+
+    def has_decimal(val: float) -> bool:
+        return not np.isclose(val, round(val))
+
+    for i in range(1, len(rows) - 1):
+        prev_row, cur_row, next_row = rows[i - 1], rows[i], rows[i + 1]
+        prev_val = parse_float_value(prev_row["detected_number"])
+        cur_val = parse_float_value(cur_row["detected_number"])
+        next_val = parse_float_value(next_row["detected_number"])
+
+        prev_conf = float(prev_row["confidence"])
+        cur_conf = float(cur_row["confidence"])
+        next_conf = float(next_row["confidence"])
+
+        if cur_val is None and prev_val is not None and next_val is not None and abs(prev_val - next_val) <= 0.4:
+            fill_val = float(np.median([prev_val, next_val]))
+            base_conf = max(0.0, min(prev_conf, next_conf) * 0.9)
+            cur_row["detected_number"] = f"{fill_val:.1f}"
+            cur_row["confidence"] = round(base_conf, 3)
+            continue
+
+        if cur_val is None:
+            continue
+
+        if not has_decimal(cur_val) and prev_val is not None and next_val is not None:
+            if (has_decimal(prev_val) or has_decimal(next_val)):
+                neighbor_med = float(np.median([prev_val, next_val]))
+                if abs(neighbor_med - cur_val) <= 1.0 and (cur_conf < 0.4 or (has_decimal(prev_val) and has_decimal(next_val))):
+                    cur_row["detected_number"] = f"{neighbor_med:.1f}"
+                    cur_row["confidence"] = round(max(cur_conf, min(prev_conf, next_conf) * 0.85), 3)
+
+
+
+def focus_blue_region(img: np.ndarray) -> Tuple[np.ndarray, ROI]:
+    if img.size == 0:
+        return img, ROI(0, 0, 0, 0)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower = np.array([90, 40, 40], dtype=np.uint8)
+    upper = np.array([140, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        h, w = img.shape[:2]
+        return img, ROI(0, 0, w, h)
+    x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(img.shape[1], x + w)
+    y1 = min(img.shape[0], y + h)
+    cropped = img[y0:y1, x0:x1]
+    return cropped if cropped.size else img, ROI(x0, y0, x1 - x0, y1 - y0)
 
 
 def main() -> None:
@@ -135,13 +224,22 @@ def main() -> None:
     frames_dir = Path(args.frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    writer = None
+    video_writer = None
     if args.annotated_mp4:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         height, width = first_frame.shape[:2]
-        writer = cv2.VideoWriter(args.annotated_mp4, fourcc, args.fps, (width, height))
+        video_writer = cv2.VideoWriter(args.annotated_mp4, fourcc, args.fps, (width, height))
 
     rows: List[dict] = []
+    smooth_history: Optional[Deque[float]] = None
+    if args.smooth_window and args.smooth_window > 1:
+        smooth_history = deque(maxlen=args.smooth_window)
+    debug_save_enabled = os.environ.get("DEBUG_SAVE_CROPS", "0") == "1"
+    debug_save_limit = int(os.environ.get("DEBUG_SAVE_LIMIT", "5"))
+    debug_saves = 0
+    last_value_float: Optional[float] = None
+    last_conf = 0.0
+
     step_ms = 1000.0 / max(args.fps, 1e-3)
     timestamp_ms = start_ms
 
@@ -152,17 +250,64 @@ def main() -> None:
         ok, frame = cap.read()
         if not ok:
             break
-        x, y, w, h = roi.as_tuple()
-        roi_img = frame[y : y + h, x : x + w]
-        value, conf, boxes = run_ocr(
-            roi_img,
-            use_easyocr_first=args.engine_easy_first,
-            strict_unit=args.strict_unit,
+
+        base_x, base_y, base_w, base_h = roi.as_tuple()
+        roi_img = frame[base_y : base_y + base_h, base_x : base_x + base_w]
+        roi_focused, focus_local = focus_blue_region(roi_img)
+        focus_roi_global = ROI(base_x + focus_local.x, base_y + focus_local.y, focus_local.w, focus_local.h)
+        if roi_focused.size == 0:
+            roi_focused = roi_img
+            focus_roi_global = roi
+
+        h_focus = roi_focused.shape[0]
+        band_top = int(0.25 * h_focus)
+        band_bottom = int(0.65 * h_focus)
+        if band_bottom <= band_top or band_bottom > h_focus:
+            band_top, band_bottom = 0, h_focus
+        roi_band = roi_focused[band_top:band_bottom, :]
+        if roi_band.size == 0:
+            roi_band = roi_focused
+            band_top = 0
+        digits_roi = ROI(
+            focus_roi_global.x,
+            focus_roi_global.y + band_top,
+            roi_band.shape[1],
+            roi_band.shape[0],
         )
-        label_value = value if value is not None else ""
+
         timestamp_sec = timestamp_ms / 1000.0
         ts_str = format_hms(timestamp_sec)
-        frame_filename = f"{ts_str.replace(':', '-')}.jpg"
+        capture_debug = debug_save_enabled and debug_saves < debug_save_limit
+        if capture_debug:
+            dbg_band = frames_dir / f"DBG_band_{ts_str.replace(':', '-')}"
+            cv2.imwrite(str(dbg_band), roi_band)
+            debug_saves += 1
+
+        value, conf, boxes = run_ocr(
+            roi_band,
+            use_easyocr_first=args.engine_easy_first,
+            strict_unit=args.strict_unit,
+            debug_id=ts_str if capture_debug else None,
+            debug_dir=frames_dir if capture_debug else None,
+        )
+        smoothed_value = median_smooth_value(value, smooth_history, args.smooth_window)
+        label_value = smoothed_value if smoothed_value not in (None, "") else (value or "")
+
+        numeric_label: Optional[float] = None
+        if label_value:
+            try:
+                numeric_label = float(label_value)
+            except ValueError:
+                numeric_label = None
+        if not label_value and last_value_float is not None:
+            label_value = f"{last_value_float:.1f}"
+            conf = round(last_conf * 0.8, 3)
+            numeric_label = last_value_float
+        if numeric_label is not None:
+            last_value_float = numeric_label
+            last_conf = conf
+
+        frame_filename = f"{ts_str.replace(':', '-')}" + ".jpg"
         frame_path = frames_dir / frame_filename
         cv2.imwrite(str(frame_path), frame)
 
@@ -175,16 +320,18 @@ def main() -> None:
             }
         )
 
-        if writer is not None:
+        if video_writer is not None:
             annotated = frame.copy()
-            annotate_frame(annotated, roi, boxes, f"{ts_str} -> {label_value or '?'}")
-            writer.write(annotated)
+            annotate_frame(annotated, digits_roi, boxes, f"{ts_str} -> {label_value or '?'}")
+            video_writer.write(annotated)
 
         timestamp_ms += step_ms
 
     cap.release()
-    if writer is not None:
-        writer.release()
+    if video_writer is not None:
+        video_writer.release()
+
+    temporal_patch_rows(rows)
 
     with open(args.out_csv, "w", newline="") as f:
         fieldnames = ["video_time", "detected_number", "confidence", "frame_file"]
