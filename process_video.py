@@ -14,7 +14,7 @@ from typing import Deque, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from ocr_utils import OCRBox, run_ocr
+from ocr_utils import OCRBox, run_ocr, find_degree_anchor_strict
 
 LOGGER = logging.getLogger("process_video")
 
@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Median smoothing window (set <=1 to disable)",
+    )
+    parser.add_argument(
+        "--progress_every",
+        type=int,
+        default=0,
+        help="Log progress every N processed frames (0 disables)",
     )
     return parser.parse_args()
 
@@ -136,6 +142,7 @@ def temporal_patch_rows(rows: List[dict]) -> None:
         prev_conf = float(prev_row["confidence"])
         cur_conf = float(cur_row["confidence"])
         next_conf = float(next_row["confidence"])
+        line_ratio = float(cur_row.get("line_ratio") or 0.0)
 
         if cur_val is None and prev_val is not None and next_val is not None and abs(prev_val - next_val) <= 0.4:
             fill_val = float(np.median([prev_val, next_val]))
@@ -153,6 +160,11 @@ def temporal_patch_rows(rows: List[dict]) -> None:
                 if abs(neighbor_med - cur_val) <= 1.0 and (cur_conf < 0.4 or (has_decimal(prev_val) and has_decimal(next_val))):
                     cur_row["detected_number"] = f"{neighbor_med:.1f}"
                     cur_row["confidence"] = round(max(cur_conf, min(prev_conf, next_conf) * 0.85), 3)
+                    cur_val = neighbor_med
+
+        if cur_val is not None and cur_val <= 3.0 and prev_val is not None and prev_val >= 15 and line_ratio >= 5.0:
+            cur_row["detected_number"] = f"{prev_val:.1f}"
+            cur_row["confidence"] = round(max(cur_conf, prev_conf * 0.8), 3)
 
 
 
@@ -239,6 +251,8 @@ def main() -> None:
     debug_saves = 0
     last_value_float: Optional[float] = None
     last_conf = 0.0
+    progress_every = max(0, int(args.progress_every))
+    processed = 0
 
     step_ms = 1000.0 / max(args.fps, 1e-3)
     timestamp_ms = start_ms
@@ -260,8 +274,16 @@ def main() -> None:
             focus_roi_global = roi
 
         h_focus = roi_focused.shape[0]
-        band_top = int(0.25 * h_focus)
-        band_bottom = int(0.65 * h_focus)
+        anchor_local = find_degree_anchor_strict(roi_focused)
+        if anchor_local:
+            _, ay, _, ah = anchor_local
+            band_half = max(int(1.2 * max(ah, 1)), max(ah, 4))
+            cy = ay + ah // 2
+            band_top = max(0, cy - band_half)
+            band_bottom = min(h_focus, cy + band_half)
+        else:
+            band_top = int(0.25 * h_focus)
+            band_bottom = int(0.65 * h_focus)
         if band_bottom <= band_top or band_bottom > h_focus:
             band_top, band_bottom = 0, h_focus
         roi_band = roi_focused[band_top:band_bottom, :]
@@ -279,7 +301,7 @@ def main() -> None:
         ts_str = format_hms(timestamp_sec)
         capture_debug = debug_save_enabled and debug_saves < debug_save_limit
         if capture_debug:
-            dbg_band = frames_dir / f"DBG_band_{ts_str.replace(':', '-')}"
+            dbg_band = frames_dir / f"DBG_band_{ts_str.replace(':', '-')}.jpg"
             cv2.imwrite(str(dbg_band), roi_band)
             debug_saves += 1
 
@@ -311,14 +333,19 @@ def main() -> None:
         frame_path = frames_dir / frame_filename
         cv2.imwrite(str(frame_path), frame)
 
+        line_ratio = digits_roi.w / max(1.0, digits_roi.h) if digits_roi.h else 0.0
         rows.append(
             {
                 "video_time": ts_str,
                 "detected_number": label_value,
                 "confidence": round(conf, 3),
                 "frame_file": frame_filename,
+                "line_ratio": line_ratio,
             }
         )
+        processed += 1
+        if progress_every and processed % progress_every == 0:
+            LOGGER.info("Processed %d frames (last %s)", processed, ts_str)
 
         if video_writer is not None:
             annotated = frame.copy()
@@ -338,7 +365,7 @@ def main() -> None:
         writer_csv = csv.DictWriter(f, fieldnames=fieldnames)
         writer_csv.writeheader()
         for row in rows:
-            writer_csv.writerow(row)
+            writer_csv.writerow({k: row.get(k, "") for k in fieldnames})
 
     LOGGER.info("Saved CSV to %s (frames in %s)", args.out_csv, frames_dir)
     if args.annotated_mp4:

@@ -101,17 +101,17 @@ def _tesseract_boxes(data: dict) -> List[OCRBox]:
     return boxes
 
 
-def _tess_text(img: np.ndarray, config: str) -> Tuple[str, List[OCRBox]]:
+def _tess_text(img: np.ndarray, config: str) -> Tuple[str, List[OCRBox], Optional[dict]]:
     if pytesseract is None or Output is None:
-        return "", []
+        return "", [], None
     try:
         data = pytesseract.image_to_data(img, config=config, output_type=Output.DICT)
     except Exception as exc:  # pragma: no cover
         LOGGER.error("Tesseract call failed: %s", exc)
-        return "", []
+        return "", [], None
     text = " ".join([t for t in data.get("text", []) if t.strip()])
     boxes = _tesseract_boxes(data)
-    return text, boxes
+    return text, boxes, data
 
 
 # ==== 强化工具：白字掩膜 / 锚点查找 / 回退行定位 ====
@@ -150,7 +150,7 @@ def find_degree_anchor_strict(roi_bgr: np.ndarray) -> Optional[Tuple[int, int, i
         "--oem 1 --psm 10 -c tessedit_char_whitelist=°C",
         "--oem 1 --psm 6 -c tessedit_char_whitelist=°C",
     ):
-        _, boxes = _tess_text(gray_big, cfg)
+        _, boxes, _ = _tess_text(gray_big, cfg)
         for b in boxes:
             x, y, w, h = b.bbox
             area = w * h
@@ -212,22 +212,33 @@ def extract_main_line_by_anchor(roi_bgr: np.ndarray, anchor: Tuple[int, int, int
 
 def fallback_main_line_from_band(roi_bgr: np.ndarray) -> Optional[np.ndarray]:
     H, W = roi_bgr.shape[:2]
-    y0, y1 = int(H * 0.22), int(H * 0.68)
+    if H <= 160:
+        y0, y1 = 0, H
+    else:
+        y0, y1 = int(H * 0.26), int(H * 0.62)
     band = roi_bgr[y0:y1, :]
     if band.size == 0:
         return None
     mask = white_ink_mask(band)
-    num, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    kernel_w = max(9, band.shape[1] // 18)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 5))
+    fused = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(fused, connectivity=8)
+    band_h = band.shape[0]
     candidates: List[Tuple[int, Tuple[int, int, int, int]]] = []
     for i in range(1, num):
         x, y, w, h, area = stats[i]
         if w < 0.25 * band.shape[1]:
             continue
-        if h < 0.10 * band.shape[0] or h > 0.65 * band.shape[0]:
+        if not (0.18 * band_h <= h <= 0.55 * band_h):
             continue
-        if (w / max(1.0, float(h))) < 2.5:
+        aspect = w / max(1.0, float(h))
+        if aspect < 3.0:
             continue
-        candidates.append((area, (x, y, w, h)))
+        cy = y + h / 2.0
+        if cy > 0.65 * band_h:
+            continue
+        candidates.append((w, (x, y, w, h)))
     if not candidates:
         return None
     _, (x, y, w, h) = max(candidates, key=lambda t: t[0])
@@ -240,6 +251,91 @@ def fallback_main_line_from_band(roi_bgr: np.ndarray) -> Optional[np.ndarray]:
     return line if line.size else None
 
 
+def _has_decimal_dot(bw: np.ndarray) -> bool:
+    H, W = bw.shape
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        if area <= 0.02 * (H * H) and h <= 0.35 * H and 0.25 * W < (x + w / 2) < 0.85 * W:
+            return True
+    return False
+
+
+def _ocr_data_and_conf(bw: np.ndarray, psm: int, decimal_hint: bool = False) -> Tuple[Optional[str], float]:
+    if pytesseract is None or Output is None:
+        return None, 0.0
+
+    cfg = (
+        f"--oem 1 --psm {psm} "
+        "-c classify_bln_numeric_mode=1 "
+        "-c tessedit_char_whitelist=0123456789.,"
+    )
+    try:
+        data = pytesseract.image_to_data(bw, config=cfg, output_type=Output.DICT)
+    except Exception as exc:
+        LOGGER.error("Tesseract data call failed: %s", exc)
+        return None, 0.0
+
+    texts = data.get("text", [])
+    levels = data.get("level", [])
+    confs = data.get("conf", [])
+    lefts = data.get("left", [])
+    tops = data.get("top", [])
+    widths = data.get("width", [])
+    heights = data.get("height", [])
+
+    words = []
+    for i, raw in enumerate(texts):
+        level = int(levels[i]) if i < len(levels) else 0
+        if level != 5:
+            continue
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            conf = float(confs[i])
+        except Exception:
+            conf = -1.0
+        x = int(lefts[i]) if i < len(lefts) else 0
+        y = int(tops[i]) if i < len(tops) else 0
+        w = int(widths[i]) if i < len(widths) else 0
+        h = int(heights[i]) if i < len(heights) else 0
+        words.append((token, conf, x, y, w, h))
+
+    text_source = (
+        " ".join(token for token, *_ in words)
+        if words
+        else " ".join(t.strip() for t in texts if t and t.strip())
+    )
+    tokens = [s.replace(",", ".") for s in VALUE_RE.findall(text_source)]
+    if not tokens:
+        return None, 0.0
+
+    tokens.sort(key=lambda s: ("." not in s, -len(s)))
+    best = tokens[0]
+
+    if "." not in best and decimal_hint and len(best) >= 3:
+        best = f"{best[:-1]}.{best[-1]}"
+
+    agg: List[float] = []
+    if words:
+        idx = 0
+        for token, conf, *_ in words:
+            norm = token.replace(",", ".")
+            if best.startswith(norm, idx):
+                if conf > 0:
+                    agg.append(conf / 100.0)
+                idx += len(norm)
+            if idx >= len(best):
+                break
+
+    if agg:
+        return best, float(np.mean(agg))
+
+    pixel_cov = float(np.count_nonzero(bw)) / float(max(1, bw.size))
+    proxy = min(0.95, max(0.05, 1.0 - abs(0.45 - pixel_cov) * 2.0))
+    return best, proxy
 def _save_debug_crop(img: np.ndarray, debug_dir: Optional[Path], tag: str) -> None:
     if img is None or img.size == 0 or debug_dir is None:
         return
@@ -248,37 +344,6 @@ def _save_debug_crop(img: np.ndarray, debug_dir: Optional[Path], tag: str) -> No
         cv2.imwrite(str(debug_dir / f"{tag}.jpg"), img)
     except Exception as exc:
         LOGGER.debug("Failed to save debug crop %s: %s", tag, exc)
-
-
-def _ocr_data_and_conf(bw: np.ndarray, psm: int) -> Tuple[Optional[str], float]:
-    if pytesseract is None or Output is None:
-        return None, 0.0
-    cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.,"
-    data = pytesseract.image_to_data(bw, config=cfg, output_type=Output.DICT)
-    full_txt = " ".join([t for t in data.get("text", []) if t.strip()])
-    tokens = [t.replace(",", ".") for t in VALUE_RE.findall(full_txt)]
-    if not tokens:
-        return None, 0.0
-    tokens.sort(key=lambda s: ("." not in s, -len(s)))
-    best = tokens[0]
-
-    confs: List[float] = []
-    idx = 0
-    for txt, conf in zip(data.get("text", []), data.get("conf", [])):
-        norm = txt.strip().replace(",", ".")
-        if not norm:
-            continue
-        if best.startswith(norm, idx):
-            idx += len(norm)
-            try:
-                cval = float(conf)
-                if cval >= 0:
-                    confs.append(cval / 100.0)
-            except Exception:
-                pass
-        if idx >= len(best):
-            break
-    return best, float(np.mean(confs)) if confs else 0.0
 
 
 def ocr_single_line(line_bgr: np.ndarray) -> Tuple[Optional[str], float]:
@@ -291,35 +356,63 @@ def ocr_single_line(line_bgr: np.ndarray) -> Tuple[Optional[str], float]:
         bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
         return bw
 
-    bw_pos = _prep(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
-    bw_inv = _prep(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1])
+    bw_pos_raw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    bw_inv_raw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    bw_pos = _prep(bw_pos_raw)
+    bw_inv = _prep(bw_inv_raw)
+
+    has_dot_pos = _has_decimal_dot(bw_pos_raw)
+    has_dot_inv = _has_decimal_dot(bw_inv_raw)
+    dot_hint_any = has_dot_pos or has_dot_inv
+
+    prefer_bw = bw_pos
+    prefer_hint = has_dot_pos
+    if has_dot_inv and not has_dot_pos:
+        prefer_bw = bw_inv
+        prefer_hint = has_dot_inv
+
+    other_bw = bw_inv if prefer_bw is bw_pos else bw_pos
+    other_hint = has_dot_inv if prefer_bw is bw_pos else has_dot_pos
+
+    order = [
+        ("prefer", prefer_bw, prefer_hint),
+        ("alternate", other_bw, other_hint),
+        ("gray", gray, dot_hint_any),
+    ]
+
+    def _attempt(image: np.ndarray, hint: bool) -> Tuple[Optional[str], float]:
+        val, conf = _ocr_data_and_conf(image, 7, decimal_hint=hint)
+        if val is not None:
+            return val, conf
+        return _ocr_data_and_conf(image, 13, decimal_hint=hint)
 
     best_val: Optional[str] = None
     best_score = -1.0
     best_conf = 0.0
 
-    for bw in (bw_pos, bw_inv):
-        for psm in (7, 13):
-            value_str, conf = _ocr_data_and_conf(bw, psm)
-            if value_str is None:
-                continue
-            try:
-                numeric = float(value_str)
-            except ValueError:
-                continue
-            if not 0 <= numeric <= 120:
-                continue
-            score = conf + (0.08 if "." in value_str else 0.0)
-            if score > best_score:
-                best_score = score
-                best_val = value_str
-                best_conf = conf
+    for label, img, hint in order:
+        if img is None or img.size == 0:
+            continue
+        value_str, conf = _attempt(img, hint)
+        if value_str is None:
+            continue
+        try:
+            numeric = float(value_str)
+        except ValueError:
+            continue
+        if not 0 <= numeric <= 120:
+            continue
+        score = conf + (0.08 if "." in value_str else 0.0)
+        if score > best_score:
+            best_score = score
+            best_val = value_str
+            best_conf = conf
+        if label != "gray" and "." in value_str and conf >= 0.4:
+            break
 
     if best_val is None:
         return None, 0.0
     return f"{float(best_val):.1f}", float(best_conf)
-
-
 def ocr_tesseract(img: np.ndarray) -> Tuple[str, float, List[OCRBox]]:
     if pytesseract is None or Output is None:
         LOGGER.warning("pytesseract unavailable; skipping")
@@ -392,27 +485,56 @@ def _pick_main_value(text: str, boxes: List[OCRBox], roi_h: int) -> Optional[str
     norm_text = text.replace(",", ".")
     for box in boxes:
         for match in VALUE_RE.findall(box.text.replace(",", ".")):
-            candidates.append((match.replace(",", "."), box))
+            normalized = _normalize_candidate_value(match)
+            if normalized:
+                candidates.append((normalized, box))
     if not candidates and norm_text:
         for match in VALUE_RE.findall(norm_text):
-            candidates.append((match, OCRBox((0, 0, 0, 0), match, 0.0)))
+            normalized = _normalize_candidate_value(match)
+            if normalized:
+                candidates.append((normalized, OCRBox((0, 0, 0, 0), normalized, 0.0)))
     if not candidates:
         return None
-    filtered: List[Tuple[str, OCRBox]] = []
-    for val, box in candidates:
-        try:
-            fval = float(val)
-        except ValueError:
-            continue
-        if 0 <= fval <= 120:
-            filtered.append((val, box))
-    candidates = filtered or candidates
     best_val, best_score = None, -1e9
     for val, box in candidates:
         score = _score_candidate(val, box, roi_h, _near_unit(box, boxes))
         if score > best_score:
             best_val, best_score = val, score
     return best_val
+
+
+def _normalize_candidate_value(token: str) -> Optional[str]:
+    cleaned = token.strip().replace(",", ".")
+    digits_only = "".join(ch for ch in cleaned if ch.isdigit())
+    if not digits_only:
+        return None
+    try:
+        numeric = float(cleaned)
+    except ValueError:
+        numeric = None
+    if numeric is not None and 0 <= numeric <= 120:
+        return cleaned
+    if "." not in cleaned and len(digits_only) >= 3:
+        adjusted = digits_only[:-1] + "." + digits_only[-1]
+        try:
+            numeric_adj = float(adjusted)
+        except ValueError:
+            return None
+        if 0 <= numeric_adj <= 120:
+            return adjusted
+    return None
+
+
+def _anchor_result_needs_retry(value: Optional[str], conf: float) -> bool:
+    if not value:
+        return True
+    digits = sum(ch.isdigit() for ch in value)
+    has_decimal = "." in value
+    if has_decimal:
+        if digits >= 3:
+            return False
+        return True
+    return digits < 2 or conf < 0.6
 
 
 EngineFunc = Callable[[np.ndarray], Tuple[str, float, List[OCRBox]]]
@@ -426,6 +548,7 @@ def run_ocr(
     debug_id: Optional[str] = None,
     debug_dir: Optional[Path] = None,
 ) -> Tuple[Optional[str], float, List[OCRBox]]:
+    anchor_best: Optional[Tuple[str, float]] = None
     anchor = find_degree_anchor_strict(roi_bgr)
     if anchor is not None:
         line = extract_main_line_by_anchor(roi_bgr, anchor)
@@ -436,7 +559,10 @@ def run_ocr(
             if value is not None:
                 if debug_id and debug_dir:
                     _save_debug_crop(line, debug_dir, f"DBG_line_anchor_{debug_id}")
-                return value, conf, []
+                if _anchor_result_needs_retry(value, conf):
+                    anchor_best = (value, conf)
+                else:
+                    return value, conf, []
 
     line_fb = fallback_main_line_from_band(roi_bgr)
     if line_fb is not None:
@@ -450,7 +576,7 @@ def run_ocr(
 
     roi_scaled = cv2.resize(roi_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(roi_scaled, cv2.COLOR_BGR2GRAY)
-    variants = _preprocess_dual(gray)
+    variants = [("gray", gray)] + _preprocess_dual(gray)
 
     engines: List[EngineFunc] = [ocr_tesseract, ocr_easyocr]
     if use_easyocr_first:
@@ -474,4 +600,6 @@ def run_ocr(
             if conf > best[1]:
                 best = (parsed, conf, boxes)
 
+    if best[0] is None and anchor_best is not None:
+        return anchor_best[0], anchor_best[1], []
     return best
