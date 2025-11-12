@@ -16,8 +16,26 @@ LOGGER = logging.getLogger(__name__)
 DEBUG_OCR = os.environ.get("DEBUG_OCR", "0") == "1"
 
 DIGIT_WHITELIST = "0123456789.,°C:%+-"
+LINE_WHITELIST = "-0123456789."
 VALUE_RE = re.compile(r"\d+(?:[.,]\d+)?")
+SIGNED_VALUE_RE = re.compile(r"[-\u2212\u2013\u2014]?\d+(?:[.,]\d+)?")
 UNIT_RE = re.compile(r"(?:°\s?C|\bC\b)", re.IGNORECASE)
+UNICODE_MINUS = {"\u2212", "\u2013", "\u2014", "\u2043"}
+
+_TEMP_MIN = -200.0
+_TEMP_MAX = 200.0
+
+
+def set_temp_bounds(min_val: float, max_val: float) -> None:
+    global _TEMP_MIN, _TEMP_MAX
+    if min_val >= max_val:
+        raise ValueError("temp_min must be < temp_max")
+    _TEMP_MIN = float(min_val)
+    _TEMP_MAX = float(max_val)
+
+
+def get_temp_bounds() -> Tuple[float, float]:
+    return _TEMP_MIN, _TEMP_MAX
 
 try:
     import pytesseract
@@ -48,6 +66,36 @@ class OCRBox:
     confidence: float
 
 
+def _normalize_minus(text: str) -> str:
+    if not text:
+        return text
+    for ch in UNICODE_MINUS:
+        text = text.replace(ch, "-")
+    return text
+
+
+def _in_temp_range(value: float) -> bool:
+    temp_min, temp_max = get_temp_bounds()
+    return temp_min <= value <= temp_max
+
+
+def _coerce_temp_range(value: float) -> Optional[float]:
+    if _in_temp_range(value):
+        return value
+    mirrored = -value
+    if _in_temp_range(mirrored):
+        return mirrored
+    return None
+
+
+def _format_value(value: float, template: str) -> str:
+    decimals = 1
+    if "." in template:
+        decimals = max(1, len(template.split(".")[1]))
+    fmt = "{:." + str(decimals) + "f}"
+    return fmt.format(value)
+
+
 def _aggregate_conf(vals: Sequence[float]) -> float:
     vals = [float(v) for v in vals if v is not None and v >= 0]
     return float(np.mean(vals)) if vals else 0.0
@@ -59,7 +107,9 @@ def _morph_close(bw: np.ndarray, k: int = 3) -> np.ndarray:
 
 
 def _preprocess_dual(gray: np.ndarray) -> List[Tuple[str, np.ndarray]]:
-    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=60, sigmaSpace=60)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
     bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     outs = [("otsu", _morph_close(bw, 3))]
     mean_val = float(bw.mean())
@@ -267,9 +317,10 @@ def _ocr_data_and_conf(bw: np.ndarray, psm: int, decimal_hint: bool = False) -> 
         return None, 0.0
 
     cfg = (
-        f"--oem 1 --psm {psm} "
+        f"--oem 3 --psm {psm} "
         "-c classify_bln_numeric_mode=1 "
-        "-c tessedit_char_whitelist=0123456789.,"
+        "-c tessedit_char_whitelist=-0123456789. "
+        "-c load_system_dawg=0 -c load_freq_dawg=0"
     )
     try:
         data = pytesseract.image_to_data(bw, config=cfg, output_type=Output.DICT)
@@ -293,6 +344,7 @@ def _ocr_data_and_conf(bw: np.ndarray, psm: int, decimal_hint: bool = False) -> 
         token = raw.strip()
         if not token:
             continue
+        token = _normalize_minus(token)
         try:
             conf = float(confs[i])
         except Exception:
@@ -306,36 +358,54 @@ def _ocr_data_and_conf(bw: np.ndarray, psm: int, decimal_hint: bool = False) -> 
     text_source = (
         " ".join(token for token, *_ in words)
         if words
-        else " ".join(t.strip() for t in texts if t and t.strip())
+        else " ".join(_normalize_minus(t.strip()) for t in texts if t and t.strip())
     )
-    tokens = [s.replace(",", ".") for s in VALUE_RE.findall(text_source)]
+    tokens = [s.replace(",", ".") for s in SIGNED_VALUE_RE.findall(text_source)]
     if not tokens:
         return None, 0.0
 
     tokens.sort(key=lambda s: ("." not in s, -len(s)))
-    best = tokens[0]
+    best_raw = tokens[0]
 
-    if "." not in best and decimal_hint and len(best) >= 3:
-        best = f"{best[:-1]}.{best[-1]}"
+    digits_only = best_raw.lstrip("-")
+    if "." not in best_raw and decimal_hint and len(digits_only) >= 3:
+        sign = "-" if best_raw.startswith("-") else ""
+        best_raw = f"{sign}{digits_only[:-1]}.{digits_only[-1]}"
+
+    numeric_value: Optional[float]
+    try:
+        numeric_value = float(best_raw)
+    except ValueError:
+        numeric_value = None
+
+    if numeric_value is None:
+        return None, 0.0
+
+    coerced = _coerce_temp_range(numeric_value)
+    if coerced is None:
+        return None, 0.0
 
     agg: List[float] = []
     if words:
         idx = 0
+        target = best_raw
         for token, conf, *_ in words:
             norm = token.replace(",", ".")
-            if best.startswith(norm, idx):
+            if target.startswith(norm, idx):
                 if conf > 0:
                     agg.append(conf / 100.0)
                 idx += len(norm)
-            if idx >= len(best):
+            if idx >= len(target):
                 break
 
+    value_str = _format_value(coerced, best_raw)
+
     if agg:
-        return best, float(np.mean(agg))
+        return value_str, float(np.mean(agg))
 
     pixel_cov = float(np.count_nonzero(bw)) / float(max(1, bw.size))
     proxy = min(0.95, max(0.05, 1.0 - abs(0.45 - pixel_cov) * 2.0))
-    return best, proxy
+    return value_str, proxy
 def _save_debug_crop(img: np.ndarray, debug_dir: Optional[Path], tag: str) -> None:
     if img is None or img.size == 0 or debug_dir is None:
         return
@@ -349,35 +419,25 @@ def _save_debug_crop(img: np.ndarray, debug_dir: Optional[Path], tag: str) -> No
 def ocr_single_line(line_bgr: np.ndarray) -> Tuple[Optional[str], float]:
     zoom = cv2.resize(line_bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(zoom, cv2.COLOR_BGR2GRAY)
-    gray = cv2.convertScaleAbs(gray, alpha=1.15, beta=5)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
 
-    def _prep(bw: np.ndarray) -> np.ndarray:
-        bw = cv2.dilate(bw, np.ones((2, 2), np.uint8), iterations=1)
+    def _prep_binary(bw: np.ndarray) -> np.ndarray:
+        horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+        bw = cv2.dilate(bw, horiz, iterations=1)
         bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
         return bw
 
-    bw_pos_raw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    bw_inv_raw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    bw_pos = _prep(bw_pos_raw)
-    bw_inv = _prep(bw_inv_raw)
+    bw_pos_raw = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    bw_inv_raw = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    bw_pos = _prep_binary(bw_pos_raw)
+    bw_inv = _prep_binary(bw_inv_raw)
 
-    has_dot_pos = _has_decimal_dot(bw_pos_raw)
-    has_dot_inv = _has_decimal_dot(bw_inv_raw)
-    dot_hint_any = has_dot_pos or has_dot_inv
-
-    prefer_bw = bw_pos
-    prefer_hint = has_dot_pos
-    if has_dot_inv and not has_dot_pos:
-        prefer_bw = bw_inv
-        prefer_hint = has_dot_inv
-
-    other_bw = bw_inv if prefer_bw is bw_pos else bw_pos
-    other_hint = has_dot_inv if prefer_bw is bw_pos else has_dot_pos
-
-    order = [
-        ("prefer", prefer_bw, prefer_hint),
-        ("alternate", other_bw, other_hint),
-        ("gray", gray, dot_hint_any),
+    variants = [
+        ("bw", bw_pos, _has_decimal_dot(bw_pos_raw)),
+        ("bw_inv", bw_inv, _has_decimal_dot(bw_inv_raw)),
+        ("gray", enhanced, False),
     ]
 
     def _attempt(image: np.ndarray, hint: bool) -> Tuple[Optional[str], float]:
@@ -390,7 +450,7 @@ def ocr_single_line(line_bgr: np.ndarray) -> Tuple[Optional[str], float]:
     best_score = -1.0
     best_conf = 0.0
 
-    for label, img, hint in order:
+    for label, img, hint in variants:
         if img is None or img.size == 0:
             continue
         value_str, conf = _attempt(img, hint)
@@ -400,24 +460,28 @@ def ocr_single_line(line_bgr: np.ndarray) -> Tuple[Optional[str], float]:
             numeric = float(value_str)
         except ValueError:
             continue
-        if not 0 <= numeric <= 120:
+        if not _in_temp_range(numeric):
             continue
-        score = conf + (0.08 if "." in value_str else 0.0)
+        score = conf + (0.1 if "." in value_str else 0.0)
         if score > best_score:
             best_score = score
             best_val = value_str
             best_conf = conf
-        if label != "gray" and "." in value_str and conf >= 0.4:
+        if label != "gray" and "." in value_str and conf >= 0.5:
             break
 
     if best_val is None:
         return None, 0.0
-    return f"{float(best_val):.1f}", float(best_conf)
+    return best_val, float(best_conf)
 def ocr_tesseract(img: np.ndarray) -> Tuple[str, float, List[OCRBox]]:
     if pytesseract is None or Output is None:
         LOGGER.warning("pytesseract unavailable; skipping")
         return "", 0.0, []
-    config = "--oem 1 --psm 6 -c tessedit_char_whitelist=" + DIGIT_WHITELIST
+    config = (
+        "--oem 3 --psm 6 "
+        "-c tessedit_char_whitelist=-0123456789.°C "
+        "-c load_system_dawg=0 -c load_freq_dawg=0"
+    )
     try:
         data = pytesseract.image_to_data(img, config=config, output_type=Output.DICT)
     except Exception as exc:
@@ -504,37 +568,50 @@ def _pick_main_value(text: str, boxes: List[OCRBox], roi_h: int) -> Optional[str
 
 
 def _normalize_candidate_value(token: str) -> Optional[str]:
-    cleaned = token.strip().replace(",", ".")
+    cleaned = _normalize_minus(token.strip()).replace(",", ".")
+    if not cleaned:
+        return None
     digits_only = "".join(ch for ch in cleaned if ch.isdigit())
     if not digits_only:
         return None
+
     try:
         numeric = float(cleaned)
     except ValueError:
         numeric = None
-    if numeric is not None and 0 <= numeric <= 120:
-        return cleaned
+
+    if numeric is not None:
+        coerced = _coerce_temp_range(numeric)
+        if coerced is not None:
+            return _format_value(coerced, cleaned)
+
     if "." not in cleaned and len(digits_only) >= 3:
-        adjusted = digits_only[:-1] + "." + digits_only[-1]
+        sign = "-" if cleaned.startswith("-") else ""
+        adjusted = f"{sign}{digits_only[:-1]}.{digits_only[-1]}"
         try:
             numeric_adj = float(adjusted)
         except ValueError:
             return None
-        if 0 <= numeric_adj <= 120:
-            return adjusted
+        coerced_adj = _coerce_temp_range(numeric_adj)
+        if coerced_adj is not None:
+            return _format_value(coerced_adj, adjusted)
     return None
 
 
 def _anchor_result_needs_retry(value: Optional[str], conf: float) -> bool:
     if not value:
         return True
+    try:
+        numeric = float(value)
+    except ValueError:
+        return True
+    if not _in_temp_range(numeric):
+        return True
     digits = sum(ch.isdigit() for ch in value)
     has_decimal = "." in value
-    if has_decimal:
-        if digits >= 3:
-            return False
-        return True
-    return digits < 2 or conf < 0.6
+    if digits >= 3 and (has_decimal or conf >= 0.55):
+        return False
+    return True
 
 
 EngineFunc = Callable[[np.ndarray], Tuple[str, float, List[OCRBox]]]

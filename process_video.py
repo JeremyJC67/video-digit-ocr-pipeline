@@ -14,7 +14,13 @@ from typing import Deque, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from ocr_utils import OCRBox, run_ocr, find_degree_anchor_strict
+from ocr_utils import (
+    OCRBox,
+    find_degree_anchor_strict,
+    run_ocr,
+    set_temp_bounds,
+    get_temp_bounds,
+)
 
 LOGGER = logging.getLogger("process_video")
 
@@ -58,6 +64,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Log progress every N processed frames (0 disables)",
+    )
+    parser.add_argument(
+        "--temp_min",
+        type=float,
+        default=-200.0,
+        help="Minimum valid temperature (inclusive)",
+    )
+    parser.add_argument(
+        "--temp_max",
+        type=float,
+        default=200.0,
+        help="Maximum valid temperature (inclusive)",
     )
     return parser.parse_args()
 
@@ -104,34 +122,43 @@ def compute_video_duration_ms(cap) -> Optional[float]:
 def median_smooth_value(value: Optional[str], history: Optional[Deque[float]], window: int) -> Optional[str]:
     if history is None or window <= 1:
         return value
-    if value is None or value == "":
-        return value
-    try:
-        numeric = float(value)
-    except ValueError:
+    numeric = parse_float_value(value)
+    if numeric is None:
         return value
     history.append(numeric)
     med_val = float(median(history))
-    decimals = len(value.split(".")[1]) if "." in value else 0
-    fmt = "{:." + str(decimals) + "f}" if decimals > 0 else "{:.0f}"
-    return fmt.format(med_val)
+    temp_min, temp_max = get_temp_bounds()
+    med_val = min(temp_max, max(temp_min, med_val))
+    return f"{med_val:.1f}"
 
 
 def parse_float_value(value: Optional[str]) -> Optional[float]:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        numeric = float(value)
     except ValueError:
         return None
+    temp_min, temp_max = get_temp_bounds()
+    if temp_min <= numeric <= temp_max:
+        return numeric
+    mirrored = -numeric
+    if temp_min <= mirrored <= temp_max:
+        return mirrored
+    return None
+
+
+def normalize_value_str(value: Optional[str]) -> Optional[str]:
+    numeric = parse_float_value(value)
+    if numeric is None:
+        return None
+    return f"{numeric:.1f}"
 
 
 def temporal_patch_rows(rows: List[dict]) -> None:
     if len(rows) < 3:
         return
-
-    def has_decimal(val: float) -> bool:
-        return not np.isclose(val, round(val))
+    temp_min, temp_max = get_temp_bounds()
 
     for i in range(1, len(rows) - 1):
         prev_row, cur_row, next_row = rows[i - 1], rows[i], rows[i + 1]
@@ -142,29 +169,47 @@ def temporal_patch_rows(rows: List[dict]) -> None:
         prev_conf = float(prev_row["confidence"])
         cur_conf = float(cur_row["confidence"])
         next_conf = float(next_row["confidence"])
-        line_ratio = float(cur_row.get("line_ratio") or 0.0)
 
-        if cur_val is None and prev_val is not None and next_val is not None and abs(prev_val - next_val) <= 0.4:
-            fill_val = float(np.median([prev_val, next_val]))
-            base_conf = max(0.0, min(prev_conf, next_conf) * 0.9)
-            cur_row["detected_number"] = f"{fill_val:.1f}"
+        def _fill(value: float, base_conf: float) -> None:
+            cur_row["detected_number"] = f"{value:.1f}"
             cur_row["confidence"] = round(base_conf, 3)
-            continue
+
+        if cur_val is None and prev_val is not None and next_val is not None:
+            if abs(prev_val - next_val) <= 2.0:
+                fill_val = float(np.median([prev_val, next_val]))
+                base_conf = max(0.0, min(prev_conf, next_conf) * 0.9)
+                _fill(fill_val, base_conf)
+                continue
 
         if cur_val is None:
             continue
 
-        if not has_decimal(cur_val) and prev_val is not None and next_val is not None:
-            if (has_decimal(prev_val) or has_decimal(next_val)):
-                neighbor_med = float(np.median([prev_val, next_val]))
-                if abs(neighbor_med - cur_val) <= 1.0 and (cur_conf < 0.4 or (has_decimal(prev_val) and has_decimal(next_val))):
-                    cur_row["detected_number"] = f"{neighbor_med:.1f}"
-                    cur_row["confidence"] = round(max(cur_conf, min(prev_conf, next_conf) * 0.85), 3)
-                    cur_val = neighbor_med
+        if not (temp_min <= cur_val <= temp_max):
+            cur_row["detected_number"] = ""
+            cur_row["confidence"] = 0.0
+            continue
 
-        if cur_val is not None and cur_val <= 3.0 and prev_val is not None and prev_val >= 15 and line_ratio >= 5.0:
-            cur_row["detected_number"] = f"{prev_val:.1f}"
-            cur_row["confidence"] = round(max(cur_conf, prev_conf * 0.8), 3)
+        if cur_val >= 0:
+            if prev_val is not None and next_val is not None and prev_val < 0 and next_val < 0:
+                med_val = float(np.median([prev_val, next_val]))
+                base_conf = max(cur_conf, min(prev_conf, next_conf) * 0.8)
+                _fill(med_val, base_conf)
+                cur_val = med_val
+                continue
+            if prev_val is not None and prev_val < 0:
+                _fill(prev_val, max(cur_conf, prev_conf * 0.8))
+                cur_val = prev_val
+                continue
+            if next_val is not None and next_val < 0:
+                _fill(next_val, max(cur_conf, next_conf * 0.8))
+                cur_val = next_val
+                continue
+
+        if prev_val is not None and next_val is not None:
+            if abs(prev_val - cur_val) > 5 and abs(next_val - cur_val) > 5 and abs(prev_val - next_val) <= 2:
+                med_val = float(np.median([prev_val, next_val]))
+                base_conf = max(cur_conf, min(prev_conf, next_conf) * 0.85)
+                _fill(med_val, base_conf)
 
 
 
@@ -193,6 +238,8 @@ def focus_blue_region(img: np.ndarray) -> Tuple[np.ndarray, ROI]:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+    set_temp_bounds(args.temp_min, args.temp_max)
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -312,6 +359,7 @@ def main() -> None:
             debug_id=ts_str if capture_debug else None,
             debug_dir=frames_dir if capture_debug else None,
         )
+        value = normalize_value_str(value)
         smoothed_value = median_smooth_value(value, smooth_history, args.smooth_window)
         label_value = smoothed_value if smoothed_value not in (None, "") else (value or "")
 
