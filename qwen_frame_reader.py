@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Frame-by-frame temperature reader powered by Qwen/Qwen3-VL-2B-Thinking.
+Frame-by-frame temperature reader using classic OCR (OpenCV + Tesseract).
 
-Key features:
-* Samples frames from a video at a fixed FPS (default 1 FPS).
-* Optional ROI cropping before inference.
-* Runs a local Transformers `image-text-to-text` pipeline with Qwen.
-* Forces the model to emit strict JSON so downstream parsing is stable.
-* Writes both CSV and JSONL outputs plus simple statistics.
+This script dynamically finds the blue LCD screen, rectifies it, locates the °C
+anchor, and extracts the numeric temperature line with adaptive preprocessing.
+All readings are constrained to stay within a monotonic non-increasing curve,
+matching the physical behaviour of the experiment (≈22.9 °C down to ≈-133.0 °C).
 """
 
 from __future__ import annotations
@@ -15,122 +13,50 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
-import re
-import sys
-import types
-from importlib import metadata as importlib_metadata
-from importlib.machinery import ModuleSpec
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
-import torch
-from PIL import Image
+import numpy as np
 
-if hasattr(torch, "compile"):
-    try:
-        torch.compile(lambda x: x)
-    except RuntimeError as compile_exc:  # pragma: no cover
-        if "not supported" in str(compile_exc).lower():
-
-            def _noop_compile(fn=None, *args, **kwargs):
-                if callable(fn):
-                    return fn
-
-                def decorator(func):
-                    return func
-
-                return decorator
-
-            torch.compile = _noop_compile  # type: ignore[assignment]
-
-_original_metadata_version = importlib_metadata.version
-
-
-def _patched_metadata_version(pkg_name: str) -> str:
-    try:
-        return _original_metadata_version(pkg_name)
-    except importlib_metadata.PackageNotFoundError:
-        if pkg_name == "torchvision":
-            return "0.0.0"
-        raise
-
-
-importlib_metadata.version = _patched_metadata_version  # type: ignore[misc]
-
-try:
-    import torch.distributed.tensor  # noqa: F401
-except Exception as dist_exc:  # pragma: no cover
-    if os.environ.get("QWEN_DEBUG_STUB"):
-        print(f"[qwen_frame_reader] torch.distributed.tensor unavailable: {dist_exc}", file=sys.stderr)
-    class _TorchDistTensorStub(types.ModuleType):
-        def __getattr__(self, name):  # pragma: no cover
-            def _missing(*args, **kwargs):
-                raise RuntimeError(
-                    f"torch.distributed.tensor attribute '{name}' unavailable because import failed: {dist_exc}"
-                )
-
-            return _missing
-
-    dist_stub = types.ModuleType("torch.distributed")
-    tensor_stub = _TorchDistTensorStub("torch.distributed.tensor")
-    dist_stub.tensor = tensor_stub
-    dist_stub.__spec__ = ModuleSpec("torch.distributed", loader=None)
-    tensor_stub.__spec__ = ModuleSpec("torch.distributed.tensor", loader=None)
-    sys.modules["torch.distributed"] = dist_stub
-    sys.modules["torch.distributed.tensor"] = tensor_stub
-try:
-    import sklearn  # noqa: F401
-except Exception as exc:  # pragma: no cover
-    # Stub out sklearn to prevent optional Transformers dependencies from importing
-    # the real package (which may require pyarrow/libprotobuf combos unavailable here).
-    if os.environ.get("QWEN_DEBUG_STUB"):
-        print(f"[qwen_frame_reader] sklearn unavailable: {exc}", file=sys.stderr)
-    for name in list(sys.modules):
-        if name.startswith("sklearn"):
-            sys.modules.pop(name, None)
-    class _SklearnMetricsStub(types.ModuleType):
-        def __getattr__(self, name):  # pragma: no cover
-            def _missing(*args, **kwargs):
-                raise RuntimeError(f"scikit-learn metric '{name}' unavailable because import failed: {exc}")
-
-            return _missing
-
-    stub = types.ModuleType("sklearn")
-    metrics_stub = _SklearnMetricsStub("sklearn.metrics")
-    stub.metrics = metrics_stub
-    stub.__spec__ = ModuleSpec("sklearn", loader=None)
-    metrics_stub.__spec__ = ModuleSpec("sklearn.metrics", loader=None)
-    sys.modules["sklearn"] = stub
-    sys.modules["sklearn.metrics"] = metrics_stub
-    if os.environ.get("QWEN_DEBUG_STUB"):
-        print(f"[qwen_frame_reader] stub modules: {sys.modules['sklearn']}, {sys.modules['sklearn.metrics']}", file=sys.stderr)
-
-from transformers import pipeline
-
-PROMPT = (
-    "You are reading the numeric temperature displayed in the image.\n"
-    'Return ONLY a valid JSON object on one line with key "temp_c".\n'
-    "Keep the sign (negative numbers like -138.4 are common).\n"
-    "Use exactly one decimal if present.\n"
-    'If unreadable, return {"temp_c": null}.\n'
-    "Examples:\n"
-    '{"temp_c": -138.4}\n'
-    '{"temp_c": null}\n'
-)
-
-JSON_PATTERN = re.compile(r'\{[^{}]*"temp_c"[^{}]*\}')
-NUMBER_PATTERN = re.compile(r"(-?\d+(?:\.\d)?)")
+from ocr_utils import find_degree_anchor_strict, run_ocr, set_temp_bounds
 
 
 @dataclass
 class TempResult:
     frame_idx: int
     timestamp_sec: float
-    temp_c: Optional[float]
-    raw_text: str
+    value: Optional[float]
+    confidence: float
+    raw_text: Optional[str]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Dynamic OCR temperature reader (no heavy LLM).")
+    parser.add_argument("--video", required=True, help="Input video path")
+    parser.add_argument("--extract_fps", type=float, default=1.0, help="Sample FPS (default 1)")
+    parser.add_argument("--limit", type=int, default=None, help="Process at most N frames")
+    parser.add_argument("--start_time", type=float, default=0.0, help="Start time in seconds")
+    parser.add_argument("--max_duration", type=float, default=None, help="Max seconds to analyse (from start)")
+    parser.add_argument("--roi", type=str, default=None, help="Optional ROI override: x,y,w,h")
+    parser.add_argument("--out_dir", type=str, default="outputs_ocr", help="Folder for CSV/JSON outputs")
+    parser.add_argument("--temp_min", type=float, default=-200.0, help="Minimum valid temperature")
+    parser.add_argument("--temp_max", type=float, default=200.0, help="Maximum valid temperature")
+    parser.add_argument(
+        "--no-monotonic",
+        action="store_false",
+        dest="monotonic",
+        help="Disable non-increasing enforcement",
+    )
+    parser.set_defaults(monotonic=True)
+    parser.add_argument(
+        "--monotonic_slack",
+        type=float,
+        default=0.2,
+        help="Allowed upward slack before clamping (°C)",
+    )
+    return parser.parse_args()
 
 
 def parse_roi(arg: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
@@ -139,23 +65,10 @@ def parse_roi(arg: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
     parts = [p.strip() for p in arg.split(",")]
     if len(parts) != 4:
         raise ValueError("--roi must be formatted as x,y,w,h")
-    roi = tuple(int(v) for v in parts)
-    x, y, w, h = roi
+    x, y, w, h = map(int, parts)
     if min(w, h) <= 0:
-        raise ValueError("ROI width and height must be positive")
+        raise ValueError("ROI width/height must be > 0")
     return x, y, w, h
-
-
-def crop_roi(image: Image.Image, roi: Tuple[int, int, int, int]) -> Image.Image:
-    x, y, w, h = roi
-    width, height = image.size
-    x1 = max(0, x)
-    y1 = max(0, y)
-    x2 = min(width, x + w)
-    y2 = min(height, y + h)
-    if x1 >= x2 or y1 >= y2:
-        return image
-    return image.crop((x1, y1, x2, y2))
 
 
 def seconds_to_timestamp(sec: float) -> str:
@@ -166,346 +79,236 @@ def seconds_to_timestamp(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def resolve_dtype(dtype_str: str) -> Optional[torch.dtype]:
-    mapping = {
-        "auto": None,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    if dtype_str not in mapping:
-        raise ValueError(f"Unsupported dtype {dtype_str}")
-    return mapping[dtype_str]
+def order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect
 
 
-def _device_index_from_str(device_str: str) -> int:
-    if ":" in device_str:
-        return int(device_str.split(":")[1])
-    return 0
+def blue_mask(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower = np.array([90, 40, 40], dtype=np.uint8)
+    upper = np.array([135, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.medianBlur(mask, 5)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
 
 
-def resolve_device_options(
-    device_str: str, force_device_map: bool
-) -> Tuple[Optional[torch.device], Optional[object]]:
-    normalized = (device_str or "auto").lower()
-    if force_device_map:
-        return None, _device_map_from_device_str(normalized)
-    if normalized == "auto":
-        return None, "auto"
-    if normalized == "cpu":
-        return torch.device("cpu"), None
-    if normalized == "mps":
-        return torch.device("mps"), None
-    if normalized.startswith("cuda"):
-        idx = _device_index_from_str(normalized)
-        return torch.device("cuda", idx), None
-    return None, "auto"
+def detect_screen(frame: np.ndarray, roi: Optional[Tuple[int, int, int, int]], warp_size=(900, 600)) -> np.ndarray:
+    if roi:
+        x, y, w, h = roi
+        sub = frame[y : y + h, x : x + w]
+        if sub.size == 0:
+            sub = frame
+    else:
+        sub = frame
 
+    mask = blue_mask(sub)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return cv2.resize(sub, warp_size, interpolation=cv2.INTER_LINEAR)
 
-def _device_map_from_device_str(device_str: str) -> object:
-    normalized = device_str.lower()
-    if normalized == "auto":
-        return "auto"
-    if normalized == "cpu":
-        return {"": "cpu"}
-    if normalized == "mps":
-        return {"": "mps"}
-    if normalized.startswith("cuda"):
-        idx = _device_index_from_str(normalized)
-        return {"": idx}
-    return "auto"
+    cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    if area < 0.01 * (sub.shape[0] * sub.shape[1]):
+        return cv2.resize(sub, warp_size, interpolation=cv2.INTER_LINEAR)
 
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+    if len(approx) < 4:
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        approx = np.int0(box)
 
-def build_qwen_pipeline(
-    model_name: str,
-    device: str,
-    dtype_str: str,
-    load_in_4bit: bool,
-) -> object:
-    torch_dtype = resolve_dtype(dtype_str)
-    model_kwargs = {}
-    if load_in_4bit:
-        model_kwargs["load_in_4bit"] = True
-        if torch_dtype is not None:
-            model_kwargs["bnb_4bit_compute_dtype"] = torch_dtype
-
-    resolved_device, device_map = resolve_device_options(device, force_device_map=load_in_4bit)
-
-    pipeline_kwargs = {
-        "model": model_name,
-        "trust_remote_code": True,
-    }
-    if model_kwargs:
-        pipeline_kwargs["model_kwargs"] = model_kwargs
-    if torch_dtype is not None and not load_in_4bit:
-        pipeline_kwargs["torch_dtype"] = torch_dtype
-    if device_map is not None:
-        pipeline_kwargs["device_map"] = device_map
-    elif resolved_device is not None:
-        pipeline_kwargs["device"] = resolved_device
-
-    return pipeline("image-text-to-text", **pipeline_kwargs)
-
-
-def run_inference(
-    gen_pipe,
-    image: Image.Image,
-    max_new_tokens: int,
-) -> str:
-    cleaned_image = image.convert("RGB")
-    chat = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": PROMPT},
+    if len(approx) >= 4:
+        hull = cv2.convexHull(approx)
+        if len(hull) < 4:
+            hull = approx
+        if len(hull) > 4:
+            hull = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True)
+        if len(hull) != 4:
+            hull = cv2.boxPoints(cv2.minAreaRect(cnt))
+        pts = order_points(np.float32(hull.reshape(-1, 2)))
+        dst = np.array(
+            [
+                [0, 0],
+                [warp_size[0] - 1, 0],
+                [warp_size[0] - 1, warp_size[1] - 1],
+                [0, warp_size[1] - 1],
             ],
-        }
-    ]
-    outputs = gen_pipe(
-        images=cleaned_image,
-        text=chat,
-        return_full_text=False,
-        generate_kwargs={
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-        },
-    )
-    if not outputs:
-        return ""
-    text = outputs[0].get("generated_text", "")
-    return " ".join(text.strip().split())
+            dtype=np.float32,
+        )
+        M = cv2.getPerspectiveTransform(pts, dst)
+        warped = cv2.warpPerspective(sub, M, warp_size)
+        return warped
+
+    x, y, w, h = cv2.boundingRect(cnt)
+    cropped = sub[y : y + h, x : x + w]
+    if cropped.size == 0:
+        cropped = sub
+    return cv2.resize(cropped, warp_size, interpolation=cv2.INTER_LINEAR)
 
 
-def parse_temperature(raw_text: str) -> Tuple[Optional[float], str]:
-    candidate = raw_text.strip()
-    match = JSON_PATTERN.search(candidate)
-    if match:
-        candidate = match.group(0)
-
-    temp_value: Optional[float] = None
-    try:
-        payload = json.loads(candidate)
-        temp_field = payload.get("temp_c")
-        if temp_field is None:
-            temp_value = None
-        elif isinstance(temp_field, (int, float)):
-            temp_value = float(temp_field)
-        elif isinstance(temp_field, str):
-            temp_value = float(temp_field)
-    except Exception:
-        fallback = NUMBER_PATTERN.search(raw_text)
-        if fallback:
-            try:
-                temp_value = float(fallback.group(1))
-            except ValueError:
-                temp_value = None
-
-    if temp_value is not None and not (-200.0 < temp_value < 200.0):
-        temp_value = None
-
-    if temp_value is not None:
-        temp_value = round(temp_value, 1)
-
-    return temp_value, candidate
+def extract_digit_band(screen_bgr: np.ndarray) -> np.ndarray:
+    H = screen_bgr.shape[0]
+    anchor = find_degree_anchor_strict(screen_bgr)
+    if anchor:
+        _, ay, _, ah = anchor
+        cy = ay + ah // 2
+        band_h = max(int(ah * 2.2), int(H * 0.28))
+        top = max(0, cy - band_h // 2)
+        bottom = min(H, cy + band_h // 2)
+    else:
+        top = int(0.25 * H)
+        bottom = int(0.65 * H)
+    if bottom <= top:
+        top, bottom = 0, H
+    band = screen_bgr[top:bottom, :]
+    return band if band.size else screen_bgr
 
 
-def sample_frames(
+def enforce_monotonic(results: List[TempResult], slack: float = 0.2) -> None:
+    previous: Optional[float] = None
+    for r in results:
+        if r.value is None:
+            continue
+        if previous is None:
+            previous = r.value
+            continue
+        if r.value > previous + slack:
+            r.value = previous
+        else:
+            previous = r.value
+
+
+def sample_video(
     video_path: str,
     extract_fps: float,
+    start_sec: float,
     limit: Optional[int],
-) -> List[Tuple[int, float, Image.Image]]:
-    if extract_fps <= 0:
-        raise ValueError("--extract_fps must be > 0")
-
+    max_duration: Optional[float],
+    roi: Optional[Tuple[int, int, int, int]],
+) -> List[TempResult]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Unable to open video: {video_path}")
+        raise FileNotFoundError(f"Unable to open video: {video_path}")
 
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    max_index = max(total_frames - 1, 0)
-
-    results: List[Tuple[int, float, Image.Image]] = []
-    step_sec = 1.0 / extract_fps
-    timestamp = 0.0
-    taken = 0
-
-    try:
-        while True:
-            if limit is not None and taken >= limit:
-                break
-            frame_idx = int(round(timestamp * native_fps))
-            frame_idx = min(max(frame_idx, 0), max_index)
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb)
-            results.append((frame_idx, timestamp, pil_image))
-
-            taken += 1
-            timestamp += step_sec
-
-            if total_frames and frame_idx >= max_index:
-                break
-    finally:
-        cap.release()
-
-    return results
-
-
-def infer_video(
-    video_path: str,
-    gen_pipe,
-    extract_fps: float,
-    limit: Optional[int],
-    roi: Optional[Tuple[int, int, int, int]],
-    max_new_tokens: int,
-) -> List[TempResult]:
-    frame_batches = sample_frames(video_path, extract_fps, limit)
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or extract_fps or 30.0
     results: List[TempResult] = []
+    step = 1.0 / max(extract_fps, 1e-6)
+    timestamp = max(0.0, start_sec)
+    processed = 0
+    max_ts = timestamp + max_duration if max_duration is not None else None
 
-    for idx, (frame_idx, timestamp_sec, pil_image) in enumerate(frame_batches):
-        roi_image = crop_roi(pil_image, roi) if roi else pil_image
-        text = run_inference(gen_pipe, roi_image, max_new_tokens)
-        temp_value, json_snippet = parse_temperature(text)
+    while True:
+        if limit is not None and processed >= limit:
+            break
+        if max_ts is not None and timestamp > max_ts + 1e-6:
+            break
+
+        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
+        screen = detect_screen(frame, roi)
+        digit_band = extract_digit_band(screen)
+        value_str, conf, _ = run_ocr(digit_band, strict_unit=True)
+
+        value: Optional[float]
+        try:
+            value = float(value_str) if value_str is not None else None
+        except (TypeError, ValueError):
+            value = None
+
+        frame_idx = int(round(timestamp * native_fps))
         results.append(
             TempResult(
                 frame_idx=frame_idx,
-                timestamp_sec=timestamp_sec,
-                temp_c=temp_value,
-                raw_text=json_snippet,
+                timestamp_sec=timestamp,
+                value=value,
+                confidence=float(conf),
+                raw_text=value_str,
             )
         )
-        print(
-            f"[{idx + 1:04d}] frame={frame_idx:06d} "
-            f"time={seconds_to_timestamp(timestamp_sec)} "
-            f"temp_c={temp_value if temp_value is not None else 'null'} "
-            f"raw={json_snippet}"
-        )
 
+        processed += 1
+        timestamp += step
+
+    cap.release()
     return results
 
 
-def save_results(
-    data: List[TempResult],
-    out_dir: Path,
-) -> Tuple[Path, Path]:
+def save_outputs(results: List[TempResult], out_dir: Path) -> Tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "results.csv"
     jsonl_path = out_dir / "results.jsonl"
 
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["frame", "timestamp", "temp_c"])
-        for item in data:
+    with csv_path.open("w", newline="", encoding="utf-8") as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow(["frame", "timestamp", "temp_c", "confidence", "raw"])
+        for r in results:
             writer.writerow(
                 [
-                    item.frame_idx,
-                    seconds_to_timestamp(item.timestamp_sec),
-                    "" if item.temp_c is None else f"{item.temp_c:.1f}",
+                    r.frame_idx,
+                    seconds_to_timestamp(r.timestamp_sec),
+                    "" if r.value is None else f"{r.value:.1f}",
+                    f"{r.confidence:.3f}",
+                    r.raw_text or "",
                 ]
             )
 
-    with jsonl_path.open("w", encoding="utf-8") as f:
-        for item in data:
-            payload = {
-                "frame": item.frame_idx,
-                "timestamp": seconds_to_timestamp(item.timestamp_sec),
-                "temp_c": item.temp_c,
-                "raw": item.raw_text,
+    with jsonl_path.open("w", encoding="utf-8") as f_json:
+        for r in results:
+            obj = {
+                "frame": r.frame_idx,
+                "timestamp": seconds_to_timestamp(r.timestamp_sec),
+                "temp_c": r.value,
+                "confidence": r.confidence,
+                "raw": r.raw_text,
             }
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            f_json.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
     return csv_path, jsonl_path
 
 
 def print_stats(results: List[TempResult]) -> None:
-    temps = [item.temp_c for item in results if item.temp_c is not None]
+    vals = [r.value for r in results if r.value is not None]
     total = len(results)
-    valid = len(temps)
-    nulls = total - valid
-    print(f"\nTotal frames: {total} | Valid: {valid} | Null: {nulls}")
-    if temps:
-        mean = sum(temps) / valid
-        print(f"min/mean/max: {min(temps):.1f} / {mean:.1f} / {max(temps):.1f} °C\n")
-    else:
-        print("")
+    valid = len(vals)
+    print(f"\nTotal frames: {total} | Valid readings: {valid} | Null: {total - valid}")
+    if not vals:
+        return
+    print(f"min/mean/max: {min(vals):.1f} / {sum(vals) / len(vals):.1f} / {max(vals):.1f} °C")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Frame-wise temperature reader using Qwen and Transformers pipeline."
-    )
-    parser.add_argument("--video", required=True, help="Path to the input video file")
-    parser.add_argument("--extract_fps", type=float, default=1.0, help="Sampling FPS (default 1)")
-    parser.add_argument("--limit", type=int, default=None, help="Only process the first N sampled frames")
-    parser.add_argument("--roi", type=str, default=None, help="Crop ROI formatted as x,y,w,h")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen3-VL-2B-Thinking",
-        help="Transformers model name",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device hint: auto|cpu|mps|cuda[:id]",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="auto",
-        choices=["auto", "float16", "bfloat16", "float32"],
-        help="Desired torch dtype",
-    )
-    parser.add_argument(
-        "--load_in_4bit",
-        action="store_true",
-        help="Load the model in 4-bit (requires bitsandbytes)",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=64,
-        help="Max new tokens for generation (default 64)",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default="outputs",
-        help="Directory for CSV/JSONL outputs",
-    )
-    args = parser.parse_args()
+    args = parse_args()
 
     roi = parse_roi(args.roi)
-    out_dir = Path(args.out_dir)
+    set_temp_bounds(args.temp_min, args.temp_max)
 
-    print(
-        f"Loading model {args.model} "
-        f"(device={args.device}, dtype={args.dtype}, load_in_4bit={args.load_in_4bit})"
-    )
-    gen_pipe = build_qwen_pipeline(args.model, args.device, args.dtype, args.load_in_4bit)
-
-    print(f"Extracting frames from {args.video} at {args.extract_fps} fps")
-    if roi:
-        print(f"Applying ROI: x={roi[0]}, y={roi[1]}, w={roi[2]}, h={roi[3]}")
-
-    results = infer_video(
+    results = sample_video(
         video_path=args.video,
-        gen_pipe=gen_pipe,
         extract_fps=args.extract_fps,
+        start_sec=args.start_time,
         limit=args.limit,
+        max_duration=args.max_duration,
         roi=roi,
-        max_new_tokens=args.max_new_tokens,
     )
 
-    csv_path, jsonl_path = save_results(results, out_dir)
+    if args.monotonic:
+        enforce_monotonic(results, slack=max(0.0, float(args.monotonic_slack)))
+
+    out_dir = Path(args.out_dir)
+    csv_path, jsonl_path = save_outputs(results, out_dir)
     print_stats(results)
     print(f"Wrote {csv_path}")
     print(f"Wrote {jsonl_path}")
