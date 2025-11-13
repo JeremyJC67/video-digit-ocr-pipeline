@@ -4,5 +4,10 @@ pandas
 pytesseract
 Pillow
 streamlit
+torch
+transformers==4.44.2
+accelerate
+# Optional low-VRAM support for --load_in_4bit
+bitsandbytes
 # Optional fallback OCR
 # easyocr

@@ -1,0 +1,1 @@
+{"frame": 0, "timestamp": "00:00:00", "temp_c": 22.9, "raw": "So, let's look at the image. The temperature shown is 22.9°C. The task is to return a JSON object with \"temp_c\" key. The value should be the temperature. Since it's 22.9, we need to make sure it's in the correct format. The"}
