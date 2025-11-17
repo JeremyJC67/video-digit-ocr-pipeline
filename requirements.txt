@@ -5,9 +5,9 @@ pytesseract
 Pillow
 streamlit
 torch
-transformers==4.44.2
+transformers==4.57.1
 accelerate
-# Optional low-VRAM support for --load_in_4bit
-bitsandbytes
+# Optional low-VRAM support for --load_in_4bit (requires CUDA-enabled wheel)
+bitsandbytes==0.45.2
 # Optional fallback OCR
 # easyocr

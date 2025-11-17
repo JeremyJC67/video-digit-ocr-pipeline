@@ -26,8 +26,10 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
+import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 if hasattr(torch, "compile"):
     try:
@@ -310,11 +312,46 @@ def parse_temperature(raw_text: str) -> Tuple[Optional[float], str]:
     return temp_value, candidate
 
 
+def highlight_digits(
+    frame_bgr: np.ndarray,
+    roi: Optional[Tuple[int, int, int, int]],
+    min_area: int = 25,
+) -> np.ndarray:
+    if frame_bgr is None or roi is None:
+        return frame_bgr
+    x, y, w, h = roi
+    height, width = frame_bgr.shape[:2]
+    x1 = max(0, min(width, x))
+    y1 = max(0, min(height, y))
+    x2 = max(0, min(width, x + w))
+    y2 = max(0, min(height, y + h))
+    if x1 >= x2 or y1 >= y2:
+        return frame_bgr
+    roi_slice = frame_bgr[y1:y2, x1:x2]
+    if roi_slice.size == 0:
+        return frame_bgr
+    gray = cv2.cvtColor(roi_slice, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    centers: List[Tuple[int, int]] = []
+    for label_idx in range(1, num_labels):
+        area = stats[label_idx, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        cx, cy = centroids[label_idx]
+        centers.append((int(x1 + cx), int(y1 + cy)))
+    for cx, cy in sorted(centers, key=lambda pt: pt[0]):
+        cv2.circle(frame_bgr, (cx, cy), 8, (0, 255, 0), 2)
+    return frame_bgr
+
+
 def sample_frames(
     video_path: str,
     extract_fps: float,
     limit: Optional[int],
-) -> List[Tuple[int, float, Image.Image]]:
+) -> List[Tuple[int, float, Image.Image, np.ndarray]]:
     if extract_fps <= 0:
         raise ValueError("--extract_fps must be > 0")
 
@@ -326,7 +363,7 @@ def sample_frames(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     max_index = max(total_frames - 1, 0)
 
-    results: List[Tuple[int, float, Image.Image]] = []
+    results: List[Tuple[int, float, Image.Image, np.ndarray]] = []
     step_sec = 1.0 / extract_fps
     timestamp = 0.0
     taken = 0
@@ -345,7 +382,7 @@ def sample_frames(
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(rgb)
-            results.append((frame_idx, timestamp, pil_image))
+            results.append((frame_idx, timestamp, pil_image, frame.copy()))
 
             taken += 1
             timestamp += step_sec
@@ -365,11 +402,19 @@ def infer_video(
     limit: Optional[int],
     roi: Optional[Tuple[int, int, int, int]],
     max_new_tokens: int,
+    annotated_path: Optional[Path],
 ) -> List[TempResult]:
     frame_batches = sample_frames(video_path, extract_fps, limit)
     results: List[TempResult] = []
+    progress = tqdm(total=len(frame_batches), desc="Processing frames", unit="frame")
+    writer: Optional[cv2.VideoWriter] = None
+    if annotated_path and frame_batches:
+        annotated_path.parent.mkdir(parents=True, exist_ok=True)
+        h, w = frame_batches[0][3].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(annotated_path), fourcc, extract_fps, (w, h))
 
-    for idx, (frame_idx, timestamp_sec, pil_image) in enumerate(frame_batches):
+    for idx, (frame_idx, timestamp_sec, pil_image, frame_bgr) in enumerate(frame_batches):
         roi_image = crop_roi(pil_image, roi) if roi else pil_image
         text = run_inference(gen_pipe, roi_image, max_new_tokens)
         temp_value, json_snippet = parse_temperature(text)
@@ -387,7 +432,15 @@ def infer_video(
             f"temp_c={temp_value if temp_value is not None else 'null'} "
             f"raw={json_snippet}"
         )
-
+        if writer is not None:
+            annotated_frame = (
+                highlight_digits(frame_bgr.copy(), roi) if roi else frame_bgr.copy()
+            )
+            writer.write(annotated_frame)
+        progress.update(1)
+    progress.close()
+    if writer is not None:
+        writer.release()
     return results
 
 
@@ -481,10 +534,17 @@ def main() -> None:
         default="outputs",
         help="Directory for CSV/JSONL outputs",
     )
+    parser.add_argument(
+        "--annotated_mp4",
+        type=str,
+        default=None,
+        help="Optional path to save annotated video with highlighted digits",
+    )
     args = parser.parse_args()
 
     roi = parse_roi(args.roi)
     out_dir = Path(args.out_dir)
+    annotated_path = Path(args.annotated_mp4) if args.annotated_mp4 else None
 
     print(
         f"Loading model {args.model} "
@@ -503,12 +563,15 @@ def main() -> None:
         limit=args.limit,
         roi=roi,
         max_new_tokens=args.max_new_tokens,
+        annotated_path=annotated_path,
     )
 
     csv_path, jsonl_path = save_results(results, out_dir)
     print_stats(results)
     print(f"Wrote {csv_path}")
     print(f"Wrote {jsonl_path}")
+    if annotated_path:
+        print(f"Wrote {annotated_path}")
 
 
 if __name__ == "__main__":

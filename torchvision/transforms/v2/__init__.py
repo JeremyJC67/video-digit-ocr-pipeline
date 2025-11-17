@@ -86,12 +86,14 @@ class _FunctionalNamespace:
     def normalize(self, tensor: torch.Tensor, mean: Iterable[float], std: Iterable[float]) -> torch.Tensor:
         if not isinstance(tensor, torch.Tensor):
             tensor = self.to_tensor(tensor)
+        mean_tensor = torch.as_tensor(mean, dtype=tensor.dtype, device=tensor.device)
+        std_tensor = torch.as_tensor(std, dtype=tensor.dtype, device=tensor.device)
         if tensor.ndim == 4:
-            mean_tensor = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device)[None, :, None, None]
-            std_tensor = torch.tensor(std, dtype=tensor.dtype, device=tensor.device)[None, :, None, None]
+            mean_tensor = mean_tensor[None, :, None, None]
+            std_tensor = std_tensor[None, :, None, None]
         else:
-            mean_tensor = torch.tensor(mean, dtype=tensor.dtype, device=tensor.device)[:, None, None]
-            std_tensor = torch.tensor(std, dtype=tensor.dtype, device=tensor.device)[:, None, None]
+            mean_tensor = mean_tensor[:, None, None]
+            std_tensor = std_tensor[:, None, None]
         return (tensor - mean_tensor) / std_tensor
 
     def _expand_padding(self, padding: PaddingType) -> tuple[int, int, int, int]:

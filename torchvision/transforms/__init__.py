@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Iterable, List, Sequence
 
 
 class InterpolationMode(str, Enum):
@@ -18,4 +19,24 @@ class InterpolationMode(str, Enum):
     LANCZOS = "lanczos"
 
 
-__all__ = ["InterpolationMode"]
+class Compose:
+    """
+    Simple substitute for torchvision.transforms.Compose.
+    """
+
+    def __init__(self, transforms: Sequence):
+        self.transforms: List = list(transforms)
+
+    def __call__(self, x):
+        for transform in self.transforms:
+            x = transform(x)
+        return x
+
+    def __repr__(self) -> str:
+        parts = ",\n    ".join(repr(t) for t in self.transforms)
+        return f"{self.__class__.__name__}([\n    {parts}\n])"
+
+
+from . import functional
+
+__all__ = ["InterpolationMode", "Compose", "functional"]
