@@ -132,8 +132,24 @@ PROMPT_MULTI = (
 JSON_PATTERN_MULTI = re.compile(r'\{[^{}]*"measured_temp_c"[^{}]*"bc_o_mbar"[^{}]*\}')
 TEMP_RE = re.compile(r"Measured Temp[^-\d]*(-?\d+(?:\.\d+)?)\s*°C", re.IGNORECASE)
 BCO_RE = re.compile(
-    r"^[ \t]*BC/O[^0-9+\-]*([+\-]?\d+(?:\.\d+)?(?:e[+\-]?\d+)?)\s*mbar",
-    re.IGNORECASE | re.MULTILINE,
+    r"BC/O[^0-9+\-]*([+\-]?\d+(?:\.\d+)?(?:e[+\-]?\d+)?)\s*mbar",
+    re.IGNORECASE,
+)
+REFINE_PROMPT_TEMPLATE = (
+    "You previously wrote the following analysis of a lab image:\n"
+    "-----\n"
+    "[[RAW_TEXT]]\n"
+    "-----\n\n"
+    "From THIS TEXT ONLY, extract your FINAL best guesses for:\n"
+    '1. "measured_temp_c": the measured temperature in °C.\n'
+    '2. "bc_o_mbar": the BC/O pressure in mbar.\n'
+    "Rules:\n"
+    "- Reply with EXACTLY ONE JSON object on ONE line.\n"
+    "- The FIRST character must be '{'.\n"
+    "- Do NOT explain, do NOT add any other text.\n"
+    "- If a value is missing, unreadable, or unclear, use null.\n"
+    "Example:\n"
+    '{"measured_temp_c": -132.1, "bc_o_mbar": 4.33e-4}\n'
 )
 
 
@@ -144,6 +160,7 @@ class FrameResult:
     measured_temp_c: Optional[float]
     bc_o_mbar: Optional[float]
     raw_text: str
+    refined_json: str
 
 
 def parse_roi(arg: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
@@ -261,6 +278,13 @@ def build_qwen_pipeline(
     return pipeline("image-text-to-text", **pipeline_kwargs)
 
 
+def build_text_refiner(model_name: str, device: str) -> object:
+    kwargs = {"model": model_name, "trust_remote_code": True}
+    if device != "auto":
+        kwargs["device"] = device
+    return pipeline("text-generation", **kwargs)
+
+
 def run_inference(
     gen_pipe,
     image: Image.Image,
@@ -291,6 +315,44 @@ def run_inference(
     return " ".join(text.strip().split())
 
 
+def _coerce_float(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return float(value)
+    return None
+
+
+def refine_with_text_model(
+    refiner,
+    raw_text: str,
+    max_new_tokens: int,
+) -> Tuple[Optional[float], Optional[float], str]:
+    prompt = REFINE_PROMPT_TEMPLATE.replace("[[RAW_TEXT]]", raw_text)
+    outputs = refiner(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        return_full_text=False,
+    )
+    text = outputs[0].get("generated_text", "").strip()
+    measured_temp = None
+    bc_o = None
+    try:
+        payload = json.loads(text)
+        measured_temp = _coerce_float(payload.get("measured_temp_c"))
+        bc_o = _coerce_float(payload.get("bc_o_mbar"))
+    except Exception:
+        measured_temp = None
+        bc_o = None
+
+    if measured_temp is not None and not (-300.0 <= measured_temp <= 300.0):
+        measured_temp = None
+    if bc_o is not None and not (1e-6 <= bc_o <= 1e-2):
+        bc_o = None
+    return measured_temp, bc_o, text
+
+
 def parse_multi_metrics(raw_text: str) -> Tuple[Optional[float], Optional[float], str]:
     candidate = raw_text.strip()
     match = JSON_PATTERN_MULTI.search(candidate)
@@ -303,17 +365,8 @@ def parse_multi_metrics(raw_text: str) -> Tuple[Optional[float], Optional[float]
         candidate = match.group(0)
         try:
             payload = json.loads(candidate)
-            mt = payload.get("measured_temp_c")
-            if isinstance(mt, (int, float)):
-                measured_temp = float(mt)
-            elif isinstance(mt, str):
-                measured_temp = float(mt)
-
-            bc = payload.get("bc_o_mbar")
-            if isinstance(bc, (int, float)):
-                bc_o = float(bc)
-            elif isinstance(bc, str):
-                bc_o = float(bc)
+            measured_temp = _coerce_float(payload.get("measured_temp_c"))
+            bc_o = _coerce_float(payload.get("bc_o_mbar"))
         except Exception:
             measured_temp = None
             bc_o = None
@@ -325,6 +378,21 @@ def parse_multi_metrics(raw_text: str) -> Tuple[Optional[float], Optional[float]
                 measured_temp = float(temp_match.group(1))
             except ValueError:
                 measured_temp = None
+
+    if bc_o is None:
+        for line in raw_text.splitlines():
+            if "bc/o" not in line.lower():
+                continue
+            lower = line.lower()
+            if "usually" in lower or "example" in lower or "approx" in lower:
+                continue
+            bc_match_line = BCO_RE.search(line)
+            if bc_match_line:
+                try:
+                    bc_o = float(bc_match_line.group(1))
+                    break
+                except ValueError:
+                    bc_o = None
 
     if bc_o is None:
         bc_match = BCO_RE.search(raw_text)
@@ -409,6 +477,8 @@ def infer_video_multi(
     limit: Optional[int],
     roi: Optional[Tuple[int, int, int, int]],
     max_new_tokens: int,
+    text_refiner,
+    refine_max_new_tokens: int,
 ) -> List[FrameResult]:
     frame_batches = sample_frames(video_path, extract_fps, limit)
     results: List[FrameResult] = []
@@ -417,7 +487,27 @@ def infer_video_multi(
     for idx, (frame_idx, timestamp_sec, pil_image, _) in enumerate(frame_batches):
         roi_image = crop_roi(pil_image, roi) if roi else pil_image
         text = run_inference(gen_pipe, roi_image, max_new_tokens)
-        measured_temp, bc_o, parsed_summary = parse_multi_metrics(text)
+        if text_refiner is not None:
+            measured_temp, bc_o, _ = refine_with_text_model(
+                text_refiner, text, refine_max_new_tokens
+            )
+            fallback_mt = fallback_bc = None
+            if measured_temp is None or bc_o is None:
+                fallback_mt, fallback_bc, _ = parse_multi_metrics(text)
+                if measured_temp is None and fallback_mt is not None:
+                    measured_temp = fallback_mt
+                if bc_o is None and fallback_bc is not None:
+                    bc_o = fallback_bc
+        else:
+            measured_temp, bc_o, _ = parse_multi_metrics(text)
+
+        summary_text = json.dumps(
+            {
+                "measured_temp_c": measured_temp,
+                "bc_o_mbar": bc_o,
+            },
+            ensure_ascii=False,
+        )
         results.append(
             FrameResult(
                 frame_idx=frame_idx,
@@ -425,6 +515,7 @@ def infer_video_multi(
                 measured_temp_c=measured_temp,
                 bc_o_mbar=bc_o,
                 raw_text=text,
+                refined_json=summary_text,
             )
         )
         print(
@@ -432,7 +523,7 @@ def infer_video_multi(
             f"time={seconds_to_timestamp(timestamp_sec)} "
             f"measured_temp_c={measured_temp if measured_temp is not None else 'null'} "
             f"bc_o_mbar={bc_o if bc_o is not None else 'null'} "
-            f"raw={parsed_summary}"
+            f"summary={summary_text}"
         )
         progress.update(1)
     progress.close()
@@ -468,6 +559,7 @@ def save_results_multi(
                 "measured_temp_c": item.measured_temp_c,
                 "bc_o_mbar": item.bc_o_mbar,
                 "raw": item.raw_text,
+                "refined_json": item.refined_json,
             }
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -481,6 +573,23 @@ def smooth_bc_o(results: List[FrameResult]) -> None:
             last_valid = item.bc_o_mbar
         elif last_valid is not None:
             item.bc_o_mbar = last_valid
+    last_valid = None
+    for item in reversed(results):
+        if item.bc_o_mbar is not None:
+            last_valid = item.bc_o_mbar
+        elif last_valid is not None:
+            item.bc_o_mbar = last_valid
+
+
+def refresh_refined_json(results: List[FrameResult]) -> None:
+    for item in results:
+        item.refined_json = json.dumps(
+            {
+                "measured_temp_c": item.measured_temp_c,
+                "bc_o_mbar": item.bc_o_mbar,
+            },
+            ensure_ascii=False,
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -527,6 +636,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="outputs_multi",
         help="Directory for CSV/JSONL outputs",
     )
+    parser.add_argument(
+        "--refine_model",
+        type=str,
+        default=None,
+        help="Optional text-generation model name for refining raw analyses via JSON.",
+    )
+    parser.add_argument(
+        "--refine_device",
+        type=str,
+        default="auto",
+        help="Device hint for the refine model: auto|cpu|cuda[:id]",
+    )
+    parser.add_argument(
+        "--refine_max_new_tokens",
+        type=int,
+        default=128,
+        help="Max new tokens for the refine text-generation step (default 128)",
+    )
     return parser
 
 
@@ -536,6 +663,13 @@ def main() -> None:
 
     roi = parse_roi(args.roi)
     out_dir = Path(args.out_dir)
+    text_refiner = None
+    if args.refine_model:
+        print(
+            f"Loading refine model {args.refine_model} "
+            f"(device={args.refine_device})"
+        )
+        text_refiner = build_text_refiner(args.refine_model, args.refine_device)
 
     print(
         f"Loading model {args.model} "
@@ -554,9 +688,12 @@ def main() -> None:
         limit=args.limit,
         roi=roi,
         max_new_tokens=args.max_new_tokens,
+        text_refiner=text_refiner,
+        refine_max_new_tokens=args.refine_max_new_tokens,
     )
 
     smooth_bc_o(results)
+    refresh_refined_json(results)
     csv_path, jsonl_path = save_results_multi(results, out_dir)
     print(f"Wrote {csv_path}")
     print(f"Wrote {jsonl_path}")
